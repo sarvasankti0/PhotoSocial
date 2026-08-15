@@ -1,0 +1,252 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // The writer is the official developer account (isOfficial flag is set on
+    // their profile doc once, from the Firebase console). Only this account may
+    // grant or revoke the verified tick.
+    function isOfficialAccount() {
+      return request.auth != null
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isOfficial == true;
+    }
+
+    // Whether `viewer` may read a post: public posts, the author themself,
+    // or an approved follower of the author.
+    function canSeePost(viewer, postId) {
+      let post = get(/databases/$(database)/documents/posts/$(postId)).data;
+      if (post.isPrivate != true) return true;
+      if (post.authorId == viewer) return true;
+      return exists(/databases/$(database)/documents/users/$(viewer)/following/$(post.authorId));
+    }
+
+    // Whether `viewer` may read a user's 24-hour statuses: public accounts are
+    // always visible, private accounts only to themselves and approved
+    // followers (mirrors the post privacy model).
+    function canSeeStatus(viewer, authorId) {
+      let author = get(/databases/$(database)/documents/users/$(authorId)).data;
+      if (author.isPrivate != true) return true;
+      if (authorId == viewer) return true;
+      return exists(/databases/$(database)/documents/users/$(viewer)/following/$(authorId));
+    }
+
+    // ---- Users ----
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create: if isOwner(uid);
+      allow update: if signedIn() && (
+        // Normal self-edit: verified/official flags can never change here.
+        (isOwner(uid)
+          && request.resource.data.followersCount >= 0
+          && request.resource.data.followingCount >= 0
+          && request.resource.data.postsCount >= 0
+          && request.resource.data.isVerified == resource.data.isVerified
+          && request.resource.data.isOfficial == resource.data.isOfficial
+          // photoURL may be a base64 data URL; keep the doc under the 1 MiB limit.
+          && request.resource.data.photoURL.size() <= 1000000)
+        ||
+        // Official account may only toggle verification on another profile.
+        (isOfficialAccount() && uid != request.auth.uid
+          && request.resource.data.isVerified is bool
+          && request.resource.data.isVerified != resource.data.isVerified
+          && request.resource.data.isOfficial == resource.data.isOfficial)
+      );
+      allow delete: if isOwner(uid);
+
+      // Follow relations: following/{targetId}
+      // Either party may create/delete the pair of docs: the follower on an
+      // immediate follow/unfollow, or the owner when accepting/removing a
+      // follower (private-account flow).
+      match /following/{targetId} {
+        allow read: if signedIn();
+        allow create: if signedIn() && targetId != uid
+          && (isOwner(uid) || isOwner(targetId));
+        allow delete: if signedIn() && targetId != uid
+          && (isOwner(uid) || isOwner(targetId));
+      }
+
+      // Followers: followers/{followerId}
+      match /followers/{followerId} {
+        allow read: if signedIn();
+        allow create: if signedIn() && followerId != uid
+          && (isOwner(followerId) || isOwner(uid));
+        allow delete: if signedIn() && followerId != uid
+          && (isOwner(followerId) || isOwner(uid));
+      }
+
+      // Pending follow requests: followRequests/{requesterId}
+      match /followRequests/{requesterId} {
+        // The requester can see/withdraw their own request; the owner manages it.
+        allow read: if isOwner(requesterId) || isOwner(uid);
+        allow create: if signedIn() && requesterId == request.auth.uid && requesterId != uid;
+        allow delete: if isOwner(requesterId) || isOwner(uid);
+      }
+
+      // Saved posts
+      match /savedPosts/{postId} {
+        allow read: if isOwner(uid);
+        allow create: if isOwner(uid);
+        allow delete: if isOwner(uid);
+      }
+
+      // Notifications (follows, likes, comments, replies)
+      match /notifications/{notifId} {
+        allow read: if isOwner(uid);
+        allow create: if signedIn()
+          && request.resource.data.actorId == request.auth.uid
+          && request.resource.data.actorName is string
+          && request.resource.data.actorPhotoURL is string
+          && request.resource.data.type in ['follow', 'follow_request', 'follow_accepted', 'like', 'comment', 'reply']
+          && request.resource.data.postId is string
+          && request.resource.data.snippet is string
+          && request.resource.data.read == false;
+        // Only the owner may update, and only to mark the item as read.
+        allow update: if isOwner(uid)
+          && request.resource.data.read == true
+          && request.resource.data.actorId == resource.data.actorId
+          && request.resource.data.actorName == resource.data.actorName
+          && request.resource.data.actorPhotoURL == resource.data.actorPhotoURL
+          && request.resource.data.type == resource.data.type
+          && request.resource.data.postId == resource.data.postId
+          && request.resource.data.snippet == resource.data.snippet
+          && request.resource.data.createdAt == resource.data.createdAt;
+        allow delete: if isOwner(uid);
+      }
+
+      // 24-hour status stories: users/{uid}/statuses/{statusId}
+      // Each status is its own document (a user can post several). Read access
+      // mirrors the post privacy model; write access is owner-only (caption /
+      // image edits), while any signed-in viewer may toggle a like or bump the
+      // comment count. Base64 images are capped to protect the 1 MiB limit.
+      match /statuses/{statusId} {
+        allow read: if signedIn() && canSeeStatus(request.auth.uid, uid);
+
+        allow create: if isOwner(uid)
+          && request.resource.data.authorId == uid
+          && request.resource.data.authorName is string
+          && request.resource.data.authorPhotoURL is string
+          && request.resource.data.imageUrl is string
+          && request.resource.data.imageUrl.size() <= 1000000
+          && request.resource.data.caption is string
+          && request.resource.data.caption.size() <= 2200
+          && request.resource.data.isPrivate is bool
+          && request.resource.data.likes.size() == 0
+          && request.resource.data.commentCount == 0
+          && request.resource.data.createdAt is timestamp
+          && request.resource.data.expiresAt is timestamp;
+
+        // Owner may edit the caption / image; everyone else may only mutate
+        // the like list or the comment count (and nothing else).
+        allow update: if signedIn() && canSeeStatus(request.auth.uid, uid) && (
+          (isOwner(uid)
+            && request.resource.data.authorId == resource.data.authorId
+            && request.resource.data.authorName == resource.data.authorName
+            && request.resource.data.authorPhotoURL == resource.data.authorPhotoURL
+            && request.resource.data.createdAt == resource.data.createdAt
+            && request.resource.data.isPrivate == resource.data.isPrivate
+            && request.resource.data.expiresAt == resource.data.expiresAt
+            && request.resource.data.caption.size() <= 2200
+            && request.resource.data.imageUrl.size() <= 1000000)
+          ||
+          (!isOwner(uid)
+            && request.resource.data.authorId == resource.data.authorId
+            && request.resource.data.authorName == resource.data.authorName
+            && request.resource.data.authorPhotoURL == resource.data.authorPhotoURL
+            && request.resource.data.createdAt == resource.data.createdAt
+            && request.resource.data.isPrivate == resource.data.isPrivate
+            && request.resource.data.expiresAt == resource.data.expiresAt
+            && request.resource.data.caption == resource.data.caption
+            && request.resource.data.imageUrl == resource.data.imageUrl
+            && (request.resource.data.likes != resource.data.likes
+                || request.resource.data.commentCount != resource.data.commentCount))
+        );
+
+        allow delete: if isOwner(uid);
+
+        // Status comments
+        match /comments/{commentId} {
+          allow read: if signedIn() && canSeeStatus(request.auth.uid, uid);
+          allow create: if signedIn() && canSeeStatus(request.auth.uid, uid)
+            && request.resource.data.authorId == request.auth.uid
+            && request.resource.data.authorName is string
+            && request.resource.data.authorPhotoURL is string
+            && request.resource.data.text is string
+            && request.resource.data.text.size() > 0
+            && request.resource.data.text.size() <= 1000
+            && request.resource.data.createdAt is timestamp;
+          // The comment's author, or the status owner, may delete it.
+          allow delete: if signedIn()
+            && (resource.data.authorId == request.auth.uid || isOwner(uid));
+        }
+      }
+    }
+
+    // ---- Posts ----
+    match /posts/{postId} {
+      allow read: if signedIn() && canSeePost(request.auth.uid, postId);
+
+      allow create: if signedIn()
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.authorName is string
+        && request.resource.data.mediaType in ['photo', 'video']
+        && request.resource.data.caption is string
+        && request.resource.data.captionLower is string
+        && request.resource.data.imageUrl is string
+        && request.resource.data.imageUrl.size() <= 800
+        && request.resource.data.isPrivate is bool
+        && request.resource.data.likes.size() == 0
+        && request.resource.data.commentCount == 0;
+
+      allow update: if signedIn()
+        && canSeePost(request.auth.uid, postId)
+        // imageUrl is a base64 data URL; keep the post doc under the 1 MiB limit.
+        && request.resource.data.imageUrl.size() <= 1000000
+        && (request.resource.data.authorId == request.auth.uid
+            || request.resource.data.likes == resource.data.likes
+            || request.resource.data.commentCount == resource.data.commentCount);
+
+      allow delete: if signedIn()
+        && resource.data.authorId == request.auth.uid;
+
+      // Comments
+      match /comments/{commentId} {
+        allow read: if signedIn() && canSeePost(request.auth.uid, postId);
+        allow create: if signedIn()
+          && canSeePost(request.auth.uid, postId)
+          && request.resource.data.authorId == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 1000
+          && request.resource.data.loves.size() == 0
+          && request.resource.data.isPinned == false;
+
+        // Anyone signed in may toggle a love; the post owner may pin/unpin.
+        allow update: if signedIn() && canSeePost(request.auth.uid, postId) && (
+          (request.resource.data.authorId == resource.data.authorId
+           && request.resource.data.authorName == resource.data.authorName
+           && request.resource.data.authorPhotoURL == resource.data.authorPhotoURL
+           && request.resource.data.createdAt == resource.data.createdAt
+           && request.resource.data.text == resource.data.text
+           && request.resource.data.replyToId == resource.data.replyToId
+           && request.resource.data.isPinned == resource.data.isPinned)
+          ||
+          (request.auth.uid == get(/databases/$(database)/documents/posts/$(postId)).data.authorId
+           && request.resource.data.text == resource.data.text
+           && request.resource.data.authorId == resource.data.authorId
+           && request.resource.data.createdAt == resource.data.createdAt)
+        );
+
+        allow delete: if signedIn()
+          && resource.data.authorId == request.auth.uid;
+      }
+    }
+  }
+}
